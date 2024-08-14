@@ -1,0 +1,884 @@
+---
+title: "Summative"
+author: "Liam Hughes"
+date: "2023-12-05"
+bibliography: References.bib
+csl: apa.csl
+nocite: '@*'
+output:
+  pdf_document:
+    keep_tex: yes
+header-includes:
+- \usepackage{booktabs}
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = F,
+warning = F,
+out.width = "50%",
+fig.align='center')
+
+library(ggplot2)
+library(knitr)
+library(pander)
+library(tidyverse)
+library(AER)
+library(MASS)
+library(gridExtra)
+library(kableExtra)
+library(ggeffects)
+library(sjPlot)
+library(corrplot)
+library(glmnet)
+library(pROC)
+library(mgcv)
+library(dplyr)
+library(lme4)
+library(broom)
+library(lattice)
+```
+# Analysis 1 - Binary Logistic
+
+## Introduction
+
+The first analysis will use the "wdbc.csv" data file available in the "Data" subfolder of the main project directory. This data can also be retrieved online at https://archive.ics.uci.edu/dataset/17/breast+cancer+wisconsin+diagnostic. This dataset provides the maximum value, average (mean) value and standard error for 10 different features of masses found in women's breasts. Analysing these features has been shown to predict whether or not a mass is malignant or benign with up to 97% accuracy in previous studies (@article1). This study also indicates that the maximum  (or 'worst') values are likely to be the strongest predictors of malignancy. As such, the present analysis will consider only the maximum values of each feature when attempting to create a model. The aim of this analysis will be to create a statistical model that can accurately predict whether or not a tumour is benign or malignant based on the 10 different features provided by the data. 
+
+```{r bilog_data, echo=FALSE}
+
+#Read in data
+cancer_data <- read.csv('Data/wdbc.csv')
+
+#Change column names for clarity
+colnames(cancer_data) <- c('ID', 'Diagnosis', 'mradius', 'mtexture', 'mperimeter', 'marea', 'msmoothness', 'mcompactness', 'mconcavity', 'mconcave_points', 'msymettry' , 'mfractal' ,'seradius', 'setexture', 'seperimeter', 'searea', 'sesmoothness', 'secompactness', 'seconcavity', 'seconcave_points','sesymettry' , 'sefractal', 'lradius', 'ltexture', 'lperimeter', 
+'larea', 'lsmoothness', 'lcompactness', 'lconcavity', 'lconcave_points','lsymettry' , 'lfractal')
+
+#Select only maximum values
+cancer_data <- subset(cancer_data, select = c('ID', 'Diagnosis','lradius', 'ltexture', 'lperimeter', 
+'larea', 'lsmoothness', 'lcompactness', 'lconcavity', 'lconcave_points','lsymettry' , 'lfractal'))
+
+#Extend abbreviations
+cancer_data[cancer_data$Diagnosis == "M",]$Diagnosis <- "Malignant"
+cancer_data[cancer_data$Diagnosis == "B",]$Diagnosis <- "Benign"
+
+#Turn diagnosis into factor variable
+cancer_data$Diagnosis <- as.factor(cancer_data$Diagnosis)
+
+```
+
+## Exploratory Analysis
+
+Boxplots for each possible predictor can be seen in Figure \ref{fig:bilogexplore}. As can be seen, the general trend across all predictors tends to indicate that more extreme/larger measured values are associated with a malignant diagnosis, with the perimeter, concave points and radius measurements displaying the greatest differences between the two groups. 
+
+Due to the binary nature of the data, a binary logistic regression should be seen as most appropriate for modelling. However, there are some considerations that are required before proceeding. Firstly, as the data used are the largest values for each respective variable, there is likely to be some level of collinearity across the predictors. This is particularly true for the area, radius and perimeter variables, as the cells measured are typically round, and the formulae for calculating the area and perimeter are reliant on the radius value. Figure \ref{fig:cancercorrelation} displays a heatmap showing the correlation between predictor variables.
+
+```{r cancercorrelation, echo=FALSE, fig.cap= 'A heatmap displaying the correlation between predictor variables. Darker colours indicate higher correlation.'}
+
+#Extract predictors
+cancer_predictors <- cancer_data[, c('lradius', 'ltexture', 'lperimeter', 'larea', 'lsmoothness', 
+                            'lcompactness', 'lconcavity', 'lconcave_points','lsymettry' , 'lfractal')]
+#Examine correlation of predictors
+cancer_correlation <- cor(cancer_predictors)
+
+#Plot correlation matrix of predictors
+corrplot(cancer_correlation, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, 
+         addCoef.col = "white", number.cex = 0.7)
+
+
+```
+
+
+Furthermore, there are a large number of potential predictors, all of which could be important in diagnosis, making it irresponsible to not consider variables at first glance. The issue with using all of these predictors is the likelihood of complete or quasi-complete separation. That is, that the model predicts the outcome (benign/malignant) with perfect or near-perfect accuracy. Whilst this can sound positive, the biggest issue here is that the model likely loses generisability, as the accuracy of the model is dependant on the specific dataset. As such, penalised linear regression will be applied in order to account for both of these possible issues whilst still maintaining viability of as many predictors as possible.
+
+
+```{r bilogexplore, echo=FALSE, fig.cap= 'Boxplots displaying the differences between benign and malignant diagnoses, for each maximum value variable.'}
+
+#Change data format for boxplots
+cancer_long <- tidyr::gather(cancer_data, key = "Variable", value = "Value", -Diagnosis, -ID)
+
+#Boxplots of data
+ggplot(cancer_long, aes(x = Diagnosis, y = Value, fill = Diagnosis)) +
+  geom_boxplot() +
+  facet_wrap(~Variable, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Boxplots for all Maximum Value Variables",
+       x = "Diagnosis",
+       y = "Value")
+
+```
+
+## Data Modelling
+
+As previously mentioned, the outcome variable in this data set is binary (benign/malignant), therefore a binary logistic regression is the most logical choice for modelling. The general form for a binary logistic regression is denoted as:
+
+$$
+y_i \sim \text{Bernoulli}(\theta_i), \quad \theta_i = \text{ilogit}(\phi_i), \quad \phi_i = \beta_0 + \sum_{k=1}^K \beta_k x_{ki}, \quad \text{for} \: i \:\epsilon \:1...n.
+$$
+This indicates that each independent outcome, $y_i$, has its own probability of success, $\theta_i$ modelled by the bernoulli distribution.
+
+As was seen in figure \ref{fig:bilogexplore}, the scales of each variable were drastically different, which could influence the results of the model, as variables with scales of greater magnitude tend to have larger regression coefficients. In order to make comparisons across coefficients (and thus across different predictors), the predictor variables will be standardised. 
+
+```{r bin_standardisation, echo=FALSE}
+
+#Extract predictors
+bin_predictors <- c('lradius', 'ltexture', 'lperimeter', 'larea', 'lsmoothness', 'lcompactness',
+                    'lconcavity', 'lconcave_points', 'lsymettry', 'lfractal')
+#Copy data
+bin_standardised <- cancer_data
+
+#Standardise duplicated data
+bin_standardised[bin_predictors] <- scale(cancer_data[bin_predictors])
+
+
+```
+
+
+Now the variables are standardised, binary logistic regression can be applied. This model will use the lasso method of penalised binary logistic regression. In this method, coefficients are initially calculated using maximum likelihood estimation (values of the parameters which give the data the highest likelihood of occurence), then a penalty term, $\lambda$, is applied which shrinks all coefficients equally. Some coefficients may be shrunk to zero values, effectively removing them from the model. As such, it is unnecessary to perform nested model comparison with this method of penalised regression as the optimal model arises naturally as a result of the penalisation.
+
+The data will be split into two sets; a training set and a testing set. This is done primarily to assess whether the model performs well with unseen data. The training set will be assigned two thirds of the data at random, and the testing set will be assigned the remaining third. Cross-validation will be used on the training set to determine the optimal value for $\lambda$.
+
+```{r bin_model, echo=FALSE}
+
+#For reproducibility
+set.seed(1)
+
+#Extract outcome variable
+bin_outcome <- cancer_data$Diagnosis
+
+#Extract predictors
+bin_predictors <- bin_standardised[, 3:12]
+
+#Create index for splitting into test/train
+splitIndex <- sample(seq_len(nrow(bin_standardised)), size = 0.67 * nrow(bin_standardised))
+
+#Split data based on index
+train_data <- bin_standardised[splitIndex, ]
+test_data <- bin_standardised[-splitIndex, ]
+
+#Split so data can be used with glmnet
+x_train <- as.matrix(train_data[, 3:12])
+y_train <- train_data$Diagnosis
+x_test <- as.matrix(test_data[, 3:12])
+y_test <- test_data$Diagnosis
+
+
+
+
+```
+```{r bin_mod, echo=TRUE}
+
+#Fit model
+train_model <- cv.glmnet(x_train, y_train, alpha = 1, family = 'binomial', type.measure = 'deviance')
+#Make predictions using model
+bin_predictions <- as.numeric(predict(train_model, s = train_model$lambda.1se, newx = x_test, type = 'response'))
+```
+```{r binstats, echo=FALSE}
+
+#Extract stats for reporting
+bin_lambda <- round(train_model$lambda.1se, 2)
+bin_intercept <- round(coefficients(train_model)[1,],2)
+rad_coef <- round(coefficients(train_model)[2,],2)
+tex_coef <- round(coefficients(train_model)[3,],2)
+per_coef <- round(coefficients(train_model)[4,],2)
+smooth_coef <- round(coefficients(train_model)[6,],2)
+conc_coef <- round(coefficients(train_model)[8,],2)
+cp_coef <- round(coefficients(train_model)[9,],2)
+sym_coef <- round(coefficients(train_model)[10,],2)
+bin_coefs <- list(rad_coef, tex_coef, per_coef, smooth_coef, conc_coef, cp_coef, sym_coef)
+
+```
+
+After applying 10-fold cross validation, the optimal penalty term ($\lambda$) was calculated to be `r bin_lambda`. The intercept term, $\beta_0$, was determined to be `r bin_intercept`. As a result of the lasso penalisation, the 'area', 'compactness' and 'fractal' variables were removed from the model entirely. Therefore, the final model can be denoted as:
+
+$$
+\phi_i = \beta_0 + \beta_1rad_i + \beta_2tex_i + \beta_3per_i + \beta_4smooth_i + \beta_5conc_i + \beta_6concpoints_i + \beta_7sym \quad \text{for} \: i \:\epsilon \:1...n.
+$$
+Where $\beta_0$ = `r bin_intercept` and $\beta_1$ to $\beta_7$ are `r bin_coefs`, respectively. These coefficients indicate the change in log odds of the diagnosis of an individual patient, when the respective predictor variable increases by one unit (and all other variables are held constant). This can be somewhat difficult to intuitively interpret, so the coefficients will be transformed into incidence rate ratios through exponentiation.
+
+Incidence rate ratios represent the (multiplicative) change in odds of an event if the respective predictor increases by one unit, and all others are held constant. For example, in the context of our model, the incidence rate ratio for the radius variable is `r round(exp(rad_coef),2)`. This means that for each one unit increase of the radius variable, asssuming all other predictors are held constant, the tumour is `r round((exp(rad_coef)-1)*100)`% more likely to be malignant/cancerous. 
+
+However, what needs to be considered in this case is that the data were standardised. As such, the coefficients represent the change in log odds for a one standard deviation increase in the respective predictor, rather than a single unit. This is also true for the incidence rate ratios, so in the previous example of the radius variable, the percentage increase is associated with a one standard deviation increase in the radius of the cell. 
+
+## Model Performance
+```{r roc, echo=FALSE, fig.cap= 'A plot to show the true positive rate against the false positive rate.'}
+
+#Create ROC data 
+roc_curve <- roc(y_test, bin_predictions)
+
+#Calculate area under ROC curve
+auc <- round(auc(roc_curve), 2)
+
+#Plot ROC data
+plot(roc_curve, main = "ROC Curve", col = "blue")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+
+```
+
+Now that the final model has been established, the performance of the model can be assessed. Figure \ref{fig:roc} displays the true positive rate against the false positive rate, using the testing data (data that the model has not encountered). As can be seen, the model performs very well at predicting malignancy, with the area under the curve being `r auc`. The area under the curve represents how well the model can distinguish between a tumour being benign and malignant. An area of 1 indicates perfect discrimination, whilst a score of 0.5 indicates a performance no better than random chance. 
+
+## Conclusion
+
+This model is able to effectively discriminate between benign and malignant tumours based on the 10 features provided by the dataset. It can therefore be concluded that using the cell features is definitely a viable method that can be used to diagnose cancers, although it should be used in conjunction with other methods due to the fatal consequences of a false-negative (i.e, a tumour identified by the model as benign but is actually malignant).
+
+# Analysis 2 - Poisson, Zero Inflated or Negative Binomial
+
+## Introduction
+
+This analysis will use the "bike_counts.csv" data file available in the "Data" subfolder of the main directory, or alternately online at https://www.kaggle.com/datasets/new-york-city/nyc-east-river-bicycle-crossings. This dataset provides daily counts for the number of bicycles crossing various bridges across the eastern side of New York City. There are a total of 11 variables: X (ID for each day), Date, Day (a repeat of the Date variable), temp_high (highest recorded temperature on a given day), temp_low (lowest recorded temperature on a given day), Precipitation (level of rainfall recorded on given day), Brooklyn.Bridge (first of 5 count variables for number of cyclists crossing respective bridge), Manhattan.Bridge, Williamsburg.Bridge, Queensboro.Bridge and Total (sum of all cyclist bridge crossings). The present analysis will use only the "Total" variable as the outcome variable as it is representative of all mentioned bridges. This data presents the question: can the daily total number of bridge crossings be predicted by the highest recorded temperature and precipitation level?
+
+```{r poisson_data, include=FALSE, echo=FALSE}
+
+#Load in dataset
+poisson_data <- read.csv("Data/bike_counts.csv")
+
+#Recode precipitation to numeric variable
+poisson_data$Precipitation <- as.numeric(poisson_data$Precipitation) 
+
+#Rename variables for ease of use
+colnames(poisson_data)[colnames(poisson_data) == "High.Temp...F."] <- "temp_high" 
+colnames(poisson_data)[colnames(poisson_data) == "Low.Temp...F."] <- "temp_low" 
+
+#Check for missing data
+sum(is.na(poisson_data)) 
+
+#Omit missing values
+poisson_data <- na.omit(poisson_data) 
+```
+
+## Exploratory Analysis
+
+```{r poissonexplore, echo = FALSE, fig.cap= "Scatterplots showing the number of bridge crossers per day by according to the day's highest recorded temperature, lowest recorded temperature and precipitation level."}
+
+#Produce scatterplots for exploration
+poiss_exp_1 <- ggplot(poisson_data, aes(x= temp_high, y= Total)) + 
+  geom_point() +
+  geom_smooth(method='glm',
+              method.args = list(family='poisson')) +
+  ggtitle("Brooklyn Bridge Crossers vs Highest Recorded Daily Temp")
+
+poiss_exp_2 <- ggplot(poisson_data, aes(x= temp_low, y= Total)) + 
+  geom_point() +
+  geom_smooth(method='glm',
+              method.args = list(family='poisson')) +
+  ggtitle("Brooklyn Bridge Crossers vs Lowest Recorded Daily Temp")
+
+poiss_exp_3 <- ggplot(poisson_data, aes(x= Precipitation, y= Total)) + 
+  geom_point() +
+  geom_smooth(method='glm',
+              method.args = list(family='poisson')) +
+  ggtitle("Brooklyn Bridge Crossers vs Precipitation")
+
+#Arrange scatterplots into grid
+grid.arrange(poiss_exp_1, poiss_exp_2, poiss_exp_3, ncol=3, nrow =1)
+```
+
+Figure \ref{fig:poissonexplore} shows the relationships between the total number of cyclists crossing all bridges and highest daily temperature, lowest daily temperature and daily precipitation, respectively. As can be seen, the temperature variables are both positively associated with the number of people crossing the bridges, whereas precipitation is negatively associated. Due to the high level of correlation between the temperature variables however, only one should be included in the model. The highest daily temperature seems to have the stronger relationship (albeit minimally) and more tightly distributed residuals, and thus will be the variable considered in the model. 
+
+## Data Modelling
+
+Due to the nature of the data being 'count' data, the most appropriate models will be based on either poisson or negative binomial regression. However, as the variance of the outcome variable is significantly greater than the mean (***m*** = `r as.integer(mean(poisson_data$Total))`, $\sigma^2$ = `r as.integer(var(poisson_data$Total))`), in this case the negative binomial model will be more appropriate in order to account for overdispersion. The general model for a negative binomial regression is: 
+
+$$
+y_i \sim \text{NegBinomial}(\mu_i, r), \quad \text{log}(\mu_i) = \beta_0 + \sum_{k=1}^K \beta_k x_{ki}, \quad \text{for} \: i \:\epsilon \:1...n.
+$$
+
+Where $y_i$ is the outcome variable, $\mu_i$ is the mean and $r$ is a unknown, constant, dispersion parameter.
+
+```{r poisson_intercept, echo=TRUE}
+
+#Initial negative binomial model
+p_mod1 <- glm.nb(Total ~ 1, data = poisson_data)
+
+#Extract r
+r1 <- round(p_mod1$theta, 2)
+
+#Extraxt mu
+mu1 <- round(p_mod1$coefficients[1], 2)
+
+#Calculate theta
+theta <- round((r1 / (r1 + mu1)), 2)
+
+#Calculate deviance
+deviance_mod1 <- -2 * logLik(p_mod1)
+
+```
+ 
+In order to better understand the data in the absence of any predictors, an intercept-only model will first be considered. The intercept only model assumes that on a given day, the total number of cyclists crossing all considered bridges is a negative binomial distribution with parameters $\mu$ = `r mu1`, $r$ = `r r1` and $\theta$ = `r theta`. 
+
+```{r negbinom distrib, echo=FALSE, fig.cap= "A negative binomial distribution based off the intercept only model."}
+
+#Values to plot
+values <- 0:30
+
+#Calculate binomial probabilities
+prob <- dnbinom(values, size = r1, prob = theta)
+
+#Plot negative binomial distribution
+plot(values, prob, type = "h", lwd = 2, col = "blue",
+     main = "Negative Binomial Distribution",
+     xlab = "Number of Successes",
+     ylab = "Probability",
+     ylim = c(0, max(prob) + 0.1))
+
+```
+
+To build on this initial model, the precipitation and temperature variables are now added in as predictors. This model is denoted as:
+$$
+\text{log}(\mu_i) = \beta_0 + \beta_1temp_{i} + \beta_2Precipitation_{i}
+$$
+
+```{r poisson_model1, echo=TRUE}
+
+#Plot second model
+p_mod2 <- glm.nb(Total ~ temp_high + Precipitation, data = poisson_data)
+
+#Compare models
+anova_1v2 <- anova(p_mod2, p_mod1)
+
+#Extract model comparison result
+anova1_lr<- anova_1v2$`LR stat.`
+
+```
+
+```{r poiss_stats1, echo=FALSE}
+
+#Calculate IRRs, %'s and deviance
+temp_IRR <- round(exp(p_mod2$coefficients[2]), 2)
+precip_IRR <- round(exp(p_mod2$coefficients[3]), 2)
+temp_percent <- round((exp(p_mod2$coefficients[2]) - 1)*100)
+precip_percent <- round((1 - exp(p_mod2$coefficients[3]))*100)
+deviance_mod2 <- -2 * logLik(p_mod2)
+
+```
+
+In this model, both temp_high ($\beta_1$ = `r round(p_mod2$coefficients[2], 2)`, SE = `r round(summary(p_mod2)$coefficients[2,2],2)`, z = `r round(summary(p_mod2)$coefficients[2,3],2)`, 95% CI{`r round(confint(p_mod2, 'temp_high'),2)`}) and precipitation ($\beta_2$ = `r round(p_mod2$coefficients[3],2)`, SE = `r round(summary(p_mod2)$coefficients[3,2],2)`, z = `r round(summary(p_mod2)$coefficients[3,3],2)`, 95% CI{`r round(confint(p_mod2, 'Precipitation'),2)`}) were calculated to be significant predictors at the 5% level. 
+
+The coefficients indicate the change in the log count of total people crossing the bridges for a one unit increase in a given predictor variable (assuming all others are held constant). This can be difficult to interpret, so for simplification the coefficients will be transformed into incidence rate ratios through exponentiation. 
+
+These ratios are  `r temp_IRR` and `r precip_IRR` for temp_high and precipitation respectively. Therefore, for each one unit increase in temp_high, we would expect to see a `r temp_percent`% increase in the total number of bridge crossings, whereas we would expect a `r precip_percent`% decrease in numbers for every unit increase in precipitation, assuming all other variables are held constant. 
+
+Deviance is a value that quantifies the difference between what the data show and what the model predicts, and as such is a key metric for assessing model fit. The deviance for this model is `r round(deviance_mod2,2)`, much lower than that of the intercept only model (`r round(deviance_mod1,2)`), indicating better fit. An ANOVA test confirms that the model with predictors is significantly better at predicting the number of bridge crossings ($\Delta_D$ = `r round(anova1_lr[2],2)`, *p* < 0.01)
+
+As displayed in the exploratory analysis, the precipitation variable had a large number of zero values, indicating days where there was no rain. As such, it would be interesting to explore this variable as a factor, separating days of rain vs no rain and seeing how this has an impact on the total number of bridge crossings. An interaction effect between the two predictors will also be considered, that is, does the fact that it rained or not change the relationship between the maximum temperature and total number of bridge crossings?
+
+```{r precip_factor, echo=FALSE}
+
+#Recode rain into factor variable
+poisson_data <- poisson_data %>%
+  mutate(Prec_Factor = as.factor(ifelse(Precipitation > 0, "rain", "no_rain")))
+
+#Final model with rain as factor
+p_mod3 <- glm.nb(Total ~ temp_high + Prec_Factor + temp_high*Prec_Factor, data = poisson_data)
+
+#Extract stats for reporting
+deviance_mod3 <- -2 * logLik(p_mod3)
+temp_IRR2 <- round(exp(p_mod3$coefficients[2]), 2)
+rain_IRR <- round(exp(p_mod3$coefficients[3]), 2)
+temp_percent2 <- round((exp(p_mod3$coefficients[2]) - 1)*100)
+rain_percent <- round((1 - exp(p_mod3$coefficients[3]))*100)
+
+#Anova between models 2 and 3
+anova_2v3 <- anova(p_mod2, p_mod3)
+
+
+
+```
+```{r pois_stats2, echo=FALSE}
+
+#Calculate IRRs, %'s and deviance
+temp_IRR <- round(exp(p_mod2$coefficients[2]), 2)
+precip_IRR <- round(exp(p_mod2$coefficients[3]), 2)
+temp_percent <- round((exp(p_mod2$coefficients[2]) - 1)*100)
+precip_percent <- round((1 - exp(p_mod2$coefficients[3]))*100)
+deviance_mod2 <- -2 * logLik(p_mod2)
+#Extract anova result
+anova2_lr<- anova_2v3$`LR stat.`
+
+```
+
+This new model can be denoted as: 
+
+$$
+\text{log}(\mu_i) = \beta_0 + \beta_1temp_{i} + \beta_2rain_{i}
+$$
+In this model, the 'rain' variable is binary and can only take the values of 0 or 1; 0 on days where there is no rain and 1 on days there is. 
+
+```{r mod3table, echo=FALSE, fig.cap= 'A summary of the model coefficients.'}
+
+#Create table to display model coefficients and associated values
+round(summary(p_mod3)$coefficients, 2) %>%
+kable(format = 'latex',
+booktabs = TRUE,
+align = 'c',
+caption = "A table displaying the model coefficients and corresponding errors, Z values and p values.",
+label = "mod3table") %>%
+kable_styling(position = 'center')
+
+```
+
+
+The coefficients and respective standard errors, z values and p values can be found in table \ref{tab:mod3table}. As can be seen, both predictors were once again considered significant at the 5% level, but the interaction effect between the two was not. This indicates that the relationship between the number of bridge crossings and highest recorded temperature is likely to hold true regardless of whether it rained or not. 
+
+The deviance of this new model (`r round(deviance_mod3,2)`) is lower than that of the previous (`r round(deviance_mod2,2)`), indicating a better fit. An ANOVA test confirms the newer model is significantly better at predicting the total number of bridge crossings ($\Delta_D$ = `r round(anova2_lr[2],2)`, *p* < 0.01), thus confirming that it is better to interpret the 'precipitation' variable as binary, where the only notable information is whether it rained or not at all, opposed to a continuous variable which indicates the amount of rain on a given day. 
+
+As with the previous model, it is easier to interpret incidence rate ratios, which are `r temp_IRR2` and `r rain_IRR` for the 'temp_high' and 'rain' variables respectively. This indicates that for a one unit increase in the 'temp_high' variable, we would expect a `r temp_percent2`% increase in crossings, whereas we would expect a `r rain_percent`% decrease on days where rain is present (assuming all other variables are held constant).
+
+## Model Prediction
+
+Now that the final model has been established, it can be used to make predictions of the total counts of bridge crossings based on the highest recorded daily temperature and whether or not it rained that day. These predictions are shown in Figure \ref{fig:negbinpredictions}.
+
+```{r negbinpredictions, echo=TRUE, fig.cap= 'Predicted Total Bridge Crossings based on the final negative binomial model. The lines indicate the predicted values and the shaded surrounding area indicate the confidence intervals.'}
+
+#Make predictions 
+negbin_predictions <- ggpredict(p_mod3, c("temp_high", "Prec_Factor"))
+
+#Plot predictions
+plot(negbin_predictions) +
+  theme_minimal() +
+  labs(title = "Predicted Counts for Negative Binomial Model",
+       x = "Highest Recorded Temperature",
+       y = "Predicted Counts",
+       color = "Rain")
+
+```
+
+## Conclusion
+
+In conclusion, it should be seen that bridge crossings can be modelled somewhat effectively from the maximum daily recorded temperature and precipitation levels, however precipitation levels should be interpreted simply as zero or non-zero in order to optimise the model. It is also likely that more information is required in order to model with greater accuracy, however the model presented in this analysis can at least capture the overall trend of the data to understand ball-park figures. 
+
+# Analysis 3 - Multi-Level Linear
+## Introduction
+
+This analysis will use the JSP.DAT data file @mortimore1988school available in the data subfolder of the main working directory, or alternatively online at https://www.bristol.ac.uk/cmm/learning/support/datasets/. The data are from 50 schools in inner London, and measure the performance of school children over a 3 year period. This dataset contains 3236 observations of 9 variables: School (ID of school attended by child), Class (class in school child attended), Sex (sex of child; boy or girl), Social (9-level factor indicating self-rated social class of child), Ravens (score on Raven's test; general ability measure taken prior to 3 year period), ID (individual ID of child), English (english test score, possible outcome variable), Math (math test score, possible outcome variable) and Year (year of study). For simplicity, and to get the best idea of a child's overall ability across maths and english, the Math and English variables will be combined into a weighted average outcome variable. This analysis will attempt to discover how an individual child's overall score varies as a function of their sex, social class and their Raven's test score, as well as to investigate whether these effects differ across schools.
+
+In light of the aims of the analysis, data from only the first year of study will be considered. The continuous variables, Ravens and Overall, will also be standardised in order to maximise interpretability of the model coefficients and prevent convergence issues. Additionally, the data will be split into training and testing sets, with the training set being assigned 80% of the data. The testing set will then be used to make predictions and assess the model's predictive ability. 
+
+The coding for each level of the Social variable, relating to the highest earner in a child's household, is as follows:
+
+1. Upper class
+2. Upper middle class
+3. Middle class, non-manual job
+4. Middle class, manual job
+5. Lower middle class
+6. Working class
+7. Long-term unemployed
+8. Not currently employed
+9. Father absent
+
+
+
+```{r multi_data, echo=FALSE}
+
+#Define column widths to extract data correctly
+col_widths <- c(2, 1, 1, 1, 2, 4, 2, 2, 1)  
+
+#Extract data
+school_data <- read.fwf("Data/JSP.DAT", widths = col_widths, header = FALSE)
+
+#Define variable names
+colnames(school_data) <- c("School", "Class", "Sex", "Social", "Ravens", "ID", "English", "Math", "Year")
+
+
+#Recode data so it's more easily interpretable
+school_data <- school_data %>%
+  mutate(Sex = ifelse(Sex == "1", "Boy", "Girl"),
+        Year = case_when(
+        Year == 0 ~ 1,
+        Year == 1 ~ 2,
+        Year == 2 ~ 3
+    )
+  )
+#Recode factors
+school_data$Sex <- as.factor(school_data$Sex)
+school_data$Social <- as.factor(school_data$Social)
+school_data$School <- as.factor(school_data$School)
+school_data$Class <- as.factor(school_data$Class)
+
+#Weighted average for outcome
+math_weight <- max(school_data$Math)/(max(school_data$Math) + max(school_data$English))
+english_weight <- max(school_data$English)/(max(school_data$Math) + max(school_data$English))
+school_data$Overall <- (school_data$English*english_weight) + (school_data$Math*math_weight)
+
+#Remove years 2 and 3
+school_data <- school_data %>%
+  filter(!(Year %in% c("2", "3")))
+
+#Standardise data
+school_data[, c("Ravens", "Overall")] <- scale(school_data[, c("Ravens", "Overall")])
+
+#Split into test/train
+train_indices_lme <- sample(seq_len(nrow(school_data)), 0.8 * nrow(school_data))
+
+# Create training and testing datasets
+train_data_lme <- school_data[train_indices_lme, ]
+test_data_lme <- school_data[-train_indices_lme, ]
+
+
+```
+
+
+## Exploratory Analysis
+The data takes on a hierarchical structure, as there are individual students, the classes that these students are from and the schools that these classes are from.
+
+```{r multiscatter, echo=FALSE, fig.cap= 'Scatterplots including regression lines to show the distribution of the weighted average test scores against the Ravens test scores, by school and class, respectively.'}
+
+#Create scatterplots with regression lines by school
+multi_plot1 <- ggplot(train_data_lme,aes(x = Ravens, y = Overall, colour = School)) +
+  geom_point() + 
+  stat_smooth(method = 'lm', se = FALSE)
+
+#Create scatterplots with regression by class
+multi_plot2 <- ggplot(train_data_lme,aes(x = Ravens, y = Overall, colour = Class)) +
+  geom_point() + 
+  stat_smooth(method = 'lm', se = FALSE)
+
+#Arrange plots into grid
+grid.arrange(multi_plot1, multi_plot2, ncol = 1, nrow = 2)
+
+```
+
+As can be seen in Figure \ref{fig:multiscatter}, there are significant differences between schools in terms of performance, both in terms of the slopes and intercepts of each regression line. The class variable seems to have little differentiation across groups, however this is somewhat irrelevant unless considered within the individual schools.  
+
+```{r multibox, echo=FALSE, fig.cap = 'Box plots to show the distribution of the weighted average variable by categorical variables Social and Sex, respectively.'}
+
+#Create boxplots for factor variables
+multi_bp1 <- ggplot(train_data_lme, aes(x = Social, y = Overall)) +
+  geom_boxplot(fill = "lightblue", color = "red") +
+  labs(title = "Weighted average score by social class",
+       x = "Social Class",
+       y = "Weighted Average Score")
+
+multi_bp2 <- ggplot(train_data_lme, aes(x = Sex, y = Overall)) +
+  geom_boxplot(fill = "lightblue", color = "red") +
+  labs(title = "Weighted average score by Sex",
+       x = "Sex",
+       y = "Weighted Average Score")
+
+#Arrange boxplots into grid
+grid.arrange(multi_bp1, multi_bp2, ncol = 2, nrow = 1)
+
+```
+
+What can also be recognised from figure \ref{fig:multibox} are the differences in weighted average scores between both the Sex and Social variables, with girls generally performing better than boys albeit with similarly distributed scores, and a great range of performance based on social class, although once again the spread is somewhat consistent among all levels.
+
+## Data Modelling
+
+As previously mentioned, this dataset provides data with a hierarchical structure, and as such is fit for multi-level (linear) regression. The general form of a multi level linear model is:
+
+$$
+ \text{for}\space i\space \epsilon \space 1...n, \quad y_i \sim N(\mu_i, \sigma^2), \quad \mu_i =  b_0 + b_1x_i + \zeta_{[s_i]0} + \zeta_{[s_i]1}x_i, \quad \text{for} \space j \space \epsilon \space 1...J, \quad \vec\zeta_j \sim N(0, \Sigma).
+$$
+What this indicates is that, each independent observation $y_i$ is modelled from a normal distribution with mean $\mu_i$ and standard deviation $\sigma$. $\mu_i$, which also represents the the expected value of the outcome variable for the $i$th observation, can be calculated through the above formula, with $b_0$ representing the intercept term and $b_1$ representing the coefficient for predictor $x_i$. This part of the formula represents the "fixed" effects, that is, effects that are expected across the entire population without regards to the hierarchical structure. 
+
+The second part of the formula can therefore be considered as the "random" effects, that is, effects that vary based on the hierarchical structure of the data. These effects are denoted by $\zeta_{[s_i]0}$, which is the "random" intercept term, and $\zeta_{[s_i]1}$, the "random" coefficient. These are not strictly random, but rather are represented by a matrix of normal distributions with mean 0 and covariance matrix $\Sigma$.
+
+To put this in the context of the present analysis, the Sex and Social variables would be part of the fixed effects; the effect of each is expected to be roughly similar across the entire population. In contrast, the school, class and year variables are all considered part of the "random" effects, as each level is expected to have slightly different effects. For example, if we have a student in a particular class, that individual class is expected to have its own distribution of scores based on class-level factors, such as the quality of teaching. The school from which the class is from is also expected to have its own distribution, based on something such as the amount of funding the school gets. The variation in these hierarchical layers can be best captured through a multi-level model. 
+
+Initially, a basic model will be plotted. Additional complexity will be added until the optimal model is found. The initial model will consider only 'ravens' variables as a predictor, with school as the only hierarchy level. 
+
+```{r lme1, echo=TRUE}
+
+#Initial mixed effects model
+lme1 <- lmer(Overall ~ Ravens + (Ravens | School), data = train_data_lme)
+
+#Extract model summary
+lme1_sum <- summary(lme1)
+
+#Extract fixed effects
+lme1_fixed <- lme1_sum$coefficients[, c("Estimate", "Std. Error", "t value")]
+
+
+```
+```{r fixtab1, echo=FALSE, fig.cap="A table displaying the initial model's fixed effects."}
+
+#Display fixed effects in table
+kable(lme1_fixed, format = "latex", caption = "Fixed Effects", booktabs = TRUE, label = "fixtab1")
+
+```
+```{r ranfig1, echo=FALSE, fig.cap="A dotplot displaying the initial model's random effects."}
+
+#Dotplots to display random intercepts and slopes
+dotplot(ranef(lme1))
+
+
+```
+
+The fixed and random effects of the initial model can be in Table \ref{tab:fixtab1} and Figure \ref{fig:ranfig1} respectively. The fixed effects can be interpreted similar to previous models; the intercept represents the value of the 'Overall' variable when all predictors are zero. The coefficient for "Ravens" represents the change in the outcome variable for a one-unit increase in the Raven's variable, assuming all other variables are held constant (irrelevant in this model's context as it is the only predictor). However, as both continuous variables have been standardised, the units in this case represent standard deviation changes, rather than individual units.
+
+Interpreting the random effects is slightly more complex. The random effects have a variance and standard deviation, so for the intercept, the variance and standard deviations represent the variability in the intercept across all schools. This is similar for the "Ravens" variable, where the variance and standard deviations represent the variability in the slope of the "Ravens" variable across all schools. As such, the random effects capture the differences across schools. 
+
+Now the initial model has been fitted, extra complexity will be added and models will be compared in order to find the optimal model. First, the "Sex" variable will be added. 
+
+```{r lme2, echo=TRUE}
+
+#Second mixed model
+lme2 <- lmer(Overall ~ Ravens + Sex + (Ravens | School), data = train_data_lme)
+
+#Compare two models
+lme_anova_1 <- anova(lme1, lme2)
+
+
+
+
+```
+```{r lme2_stats, echo=FALSE}
+
+#Extract stats for reporting
+lme1_loglik <- round(logLik(lme1), 2)
+lme2_loglik <- round(logLik(lme2), 2)
+lme_anova1_p <- round(lme_anova_1$`Pr(>Chisq)`[2], 2)
+
+```
+
+The log-likelihood of the second model is `r lme2_loglik`, significantly lower than that of the initial model (`r lme1_loglik`). An ANOVA test confirms that the second model is a better fit for the data at the 5% level (p = `r lme_anova1_p`). As such, the initial model will be rejected.
+
+Now the model will be made as complex as possible, adding the Social variable to the previous model, and also considering the Class variable as a hierarchical layer.
+
+```{r lme3, echo=TRUE}
+
+#Attempt to create third model (boundary issue)
+lme3 <- lmer(Overall ~ Ravens + Sex + Social + (Ravens | School/Class), data = train_data_lme)
+
+#Create final model
+lme4 <- lmer(Overall ~ Ravens + Sex + Social + (Ravens | School), data = train_data_lme)
+
+#Compare models 2 and 4
+lme_anova_2 <- anova(lme2, lme4)
+
+
+                      
+```
+```{r lme3_stats, echo=FALSE}
+
+#Extract stats for reporting anova
+lme4_loglik <- round(logLik(lme4), 2)
+lme_anova2_p <- round(lme_anova_2$`Pr(>Chisq)`[2], 2)
+
+#Extract final model summary
+lme4_sum <- summary(lme4)
+
+#Extract fixed effects
+lme4_fixed <- lme4_sum$coefficients[, c("Estimate", "Std. Error", "t value")]
+
+```
+
+However, when attempting to fit this model, an error is returned, specifying a boundary (singular) fit. This is likely due to overcomplicating the model with the class level of hierarchy. As such, this model will be disregarded. Instead, only the "Social" variable will be added as an additional predictor.
+
+```{r fixtab2, echo=FALSE, fig.cap="A table displaying the final model's fixed effects."}
+
+#Display fixed effects in table
+kable(lme4_fixed, format = "latex", caption = "Fixed Effects", booktabs = TRUE, label = "fixtab2")
+
+```
+```{r ranfig2, echo=FALSE, fig.cap="A dot plot displaying the final model's random effects."}
+
+#Dotplot to show random effects
+print(dotplot(ranef(lme4)), top = "")
+
+```
+
+The log-likelihood of the final model is `r lme4_loglik`, compared to `r lme2_loglik` of the previous viable model. An ANOVA test confirms that the more complex model is a significantly better fit to the data (p = `r lme_anova2_p`). This model will therefore be considered the optimal model. The fixed and random effects for this model can be seen in table \ref{tab:fixtab2} and \ref{fig:ranfig2} respectively. These can be interpreted similar to the initial model, however the interpretations of factor variables (i.e., Sex and Social) are in reference to the base level. In this analysis, the base level for "Sex" is being a boy, and the base level for "Social" is level 1. Thus, all coefficients for these two variables represent the standard deviation change of the outcome variable, assuming all other variables are held constant. For example, the "Sex" variable's base level is "Boy", so the coefficient in table \ref{tab:fixtab2} associated with "SexGirl" indicates the standard deviation increase in the "Overall" (outcome) variable if an individual is a girl (assuming all other variables are held constant). To put it as simply as possible, the model generally expects girls to achieve a higher weighted average score than boys. 
+
+## Model Prediction
+
+Now that the final model has been established, it's predictive ability will be tested using the "testing" set that was established earlier in the analysis. In order to assess the model's ability to capture the differing effects by school, 10 schools will be chosen at random to have predicted vs actual values graphs plotted. 
+
+```{r lmepred, echo=FALSE, fig.cap = 'A graph showing the predicted vs actual values for the model. The dotted red line indicates where the predicted and actual values are the same. 10 schools were picked at random due to '}
+
+#Predict on test data
+lme_predictions <- predict(lme4, newdata = test_data_lme)
+
+#Compare predicted values with actual
+lme_pred_actual <- data.frame(
+  Observed = test_data_lme$Overall,  
+  Predicted = lme_predictions,
+  School = test_data_lme$School
+)
+
+
+
+#Select schools with most data
+random_schools <- schools_most_data <- names(sort(table(lme_pred_actual$School), decreasing = TRUE))[1:10]
+
+#Select subset based on schools with most data
+schools_subset <- lme_pred_actual[lme_pred_actual$School %in% random_schools, ]
+
+#Plot observed vs predicted values by school
+ggplot(schools_subset, aes(x = Observed, y = Predicted)) +
+  geom_point() +
+  facet_wrap(~School, scales = "free") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(title = "Observed vs. Predicted by School",
+       x = "Observed",
+       y = "Predicted")
+
+
+
+```
+
+As can be seen in Figure \ref{fig:lmepred}, the model performed reasonably well at predicting the values across different schools. The dotted line in these graphs represent where the predicted and actual values are the same, thus indicating perfect prediction. Whilst most of the values do not lie exactly on this line, most show a distribution around the line, which shows that the model has done well to capture the underlying pattern across the different schools.   
+
+## Conclusion
+
+This analysis attempted to create a model which could predict how overall score varies as a function of sex, social class and Raven's test score, as well as whether these effects differ across schools. In light of the predicted vs actual graph, this model should be considered a success. The model was able to identify the differing relationships across differing schools with a good level of accuracy (at least as far as identifying the underlying patterns), as well as highlighting the overall pattern (fixed effects) that the data seemed to follow. Therefore, multi-level linear models should be seen as adequate when attempting to address differences between schools with respect to academic achievement. 
+
+
+
+
+
+
+
+
+# Analysis 4 - Nonlinear Regression
+
+## Introduction
+
+The final analysis will use the 'manufacturing.csv' data file available in the Data subfolder of the main project directory. This data file contains 3957 observations of 6 variables: 'Temperature...C', 'Pressure..kPa', 'Temperature.x.Pressure', 'Material.Fusion.Metric', 'Material.Transformation.Metric' and 'Quality.Rating'. All variables are related to particular manufacturing processes, with the latter 5 being conditions of the process and the 'Quality.Rating' intuitively being the rated quality of the outcome of said process. As such, the latter 5 are possible predictors and 'Quality.Rating' is the intended outcome variable. This analysis will attempt to use non-linear regression to create a model that accurately predicts the 'Quality.Rating' variable. 
+
+In order to later assess model quality, the dataset will be split at random into a training and testing set, with training being assigned 80% of the data. The variables will also be given simpler names that are just as easy to interpret: 'Temperature', 'Pressure', 'TempxPres', 'MFM', 'MTM' and 'Quality'. 
+
+```{r poly_data, echo=FALSE}
+#Load in data
+polynomial_data <- read.csv("Data/manufacturing.csv")
+
+#Change variable names
+colnames(polynomial_data) <- c('Temperature', 'Pressure', 'TempxPres', 'MFM', 'MTM', 'Quality')
+
+#Create split index for train/test sets
+poly_index <- sample(seq_len(nrow(polynomial_data)), size = 0.8 * nrow(polynomial_data))
+
+#Split data into train/test sets
+poly_train <- polynomial_data[poly_index, ]
+
+poly_test <- polynomial_data[-poly_index, ]
+
+options(tinytex.verbose = TRUE)
+
+```
+
+
+## Exploratory Analysis
+
+As with all previous analyses, exploratory analysis will be performed to assess potential relationships within the data. 
+
+```{r polexplore, echo=FALSE, fig.cap = 'Scatterplots to show the distribution of all possible predictor variables with the Quality variable'}
+
+#Create scatterplots to examine patterns
+pol_expl1 <- ggplot(poly_train, aes(x = Temperature, y = Quality)) +
+  geom_point()
+
+pol_expl2 <- ggplot(poly_train, aes(x = Pressure, y = Quality)) +
+  geom_point()
+
+pol_expl3 <- ggplot(poly_train, aes(x = TempxPres, y = Quality)) +
+  geom_point()
+
+pol_expl4 <- ggplot(poly_train, aes(x = MTM, y = Quality)) +
+  geom_point()
+
+pol_expl5 <- ggplot(poly_train, aes(x = MFM, y = Quality)) +
+  geom_point()
+
+#Arrange scatterplots into grid format
+grid.arrange(pol_expl1, pol_expl2, pol_expl3, pol_expl4, pol_expl5, ncol=3, nrow =2)
+
+```
+
+As can be seen in Figure \ref{fig:polexplore}, the Temperature, MTM (Material Transformation Metric) and MFM (Material Fusion Metric) all seem to have similar relationships with the quality variable, showing a sharp decrease once a certain threshold is met. In contrast, both variables relating to pressure (pressure and pressure multiplied by temperature) seem to have no clear relationship whatsoever. As such, it makes sense to exclude these variables from the initial model. 
+
+However, what is also highlighted by Figure \ref{fig:polexplore} is the possible issue of multicollinearity. This can be highlighted by the beforementioned extremely similar relationships between the quality variable and the temperature, MTM and MFM variables. 
+
+```{r polcor, echo=FALSE, fig.cap= 'A correlation matrix indicating the correlation between all variables within the dataset'}
+
+#Calculate correlation between variables
+poly_correlation <- cor(poly_train)
+
+#Plot correlation values
+corrplot(poly_correlation, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, 
+         addCoef.col = "green", number.cex = 0.7)
+
+```
+
+As suspected, the temperature, MTM and MFM variables show near perfect correlation, highlighted in figure \ref{fig:polcor}. This is an issue that will require consideration further into the analysis. Furthermore, the MFM variable shows the greatest variability with respect to the temperature and MTM variables, and as such will also be excluded from the model. 
+
+
+## Data Modelling
+
+The nonlinear approach taken will be that of a generalised additive model - a sum of smooth functions rather than a sum of linear terms. Therefore, whereas the general form for linear regression can be denoted as: 
+
+$$
+y_i\sim N(\mu_i, \sigma^2), \quad \mu_i = \beta_0 + \sum_{k=1}^K \beta_kx_{ki}, \text{for} \: i \:\epsilon \:1...n.
+$$
+Indicating that each independent observation of the outcome variable, $y_i$, comes from a normal distribution with mean $\mu_i$ and standard deviation $\sigma$, where the mean is a linear function of the predictors. 
+
+Whereas the model for a generalised additive model is:
+
+$$
+y_i\sim D(g(\mu_i)), \quad \mu_i = f_1(x_{1i}) + f_2(x_{2i},x_{3i},x_{4i}) + ...+f_L(x_{Li}), \quad \text{for} \: i \:\epsilon \:1...n.
+$$
+
+Whilst the two are similar, this new model denotes that each independent value of the outcome instead comes from some undefined distribution with parameter $\mu_i$. $\mu_i$ can then be defined from the addition of a smoothed intercept term, $f_1(x_{1i})$ and of smooth functions of the predictor variables. 
+
+The 'mgcv' R package (@wood2017gam) is used to calculate the optimal model for the data. Parameters are calculated through a process similar to maximum likelihood estimation: restricted marginal likelihood. This process balances likelihood with complexity, in order to avoid the pattern of the data being overly influenced by noise. This is reflected in two additional hyperparameters, $k$ and $sp$, which represent the number of basis functions and the smoothing penalty, respectively. In this model, the basis functions will be thin plate splines.
+
+The temperature and MTM variables will be considered individually due to their correlation, and the models compared to determine the best fit. 
+```{r polmod2, echo=TRUE}
+ 
+#Model data with only temperature as predictor
+polmod1 <- gam(Quality ~ s(Temperature), data = poly_train)
+
+```
+
+```{r polmod3, echo=TRUE}
+
+#Plot second model with MTM as predictor
+polmod2 <- gam(Quality ~ s(MTM), data = poly_train)
+
+#Anova test between models 
+pol_anova <- anova(polmod1, polmod2)
+
+#Extract deviance values
+pol_dev1 <- pol_anova$`Resid. Dev`[1]
+pol_dev2 <- pol_anova$`Resid. Dev`[2]
+
+#Extract df
+pol_df <- summary(polmod2)$s.table[1]
+
+#Extract smoothing parameter
+pol_sp <- format(polmod2$sp, scientific = FALSE)
+
+```
+
+After fitting the two models, the model with the MTM variable as a predictor had a significantly lower residual deviance (***D*** = `r as.integer(pol_dev2)`) when compared to the model with temperature as a predictor (***D*** = `r as.integer(pol_dev1)`) indicating better model fit. As such, this will be considered the optimal model. 
+
+The final model had `r round(pol_df, 2)` effective degrees of freedom, indicating the smooth term is a ninth-order polynomial. The smoothing penalty was determined to be extremely small (sp = `r polmod2$sp`).
+
+ 
+## Model Predictions
+
+Now the model is finalised, it's predictive ability should be evaluated using the testing data. 
+
+```{r polypredict, echo=TRUE, fig.cap= 'A graph showing the predicted values of the final model vs the actual values'}
+
+#Make predictions using model
+polypredict <- predict(polmod2, newdata = poly_test, type = "response")
+
+#Plot predictions
+plot(poly_test$Quality, polypredict, main = "Actual vs. Predicted", xlab = "Actual", ylab = "Predicted")
+abline(a = 0, b = 1, col = "red", lty = 2)
+
+```
+
+
+As can be seen in Figure \ref{fig:polypredict}, the model performed excellently at predicting the actual values in the testing set. The red dashed line indicates perfect prediction; where the model's predicted value and the actual value are equal. As such, the close proximity of the data points to this line indicate very good predictive performance. 
+
+## Conclusion
+
+It can be concluded that a GAM model is very effective at modelling the quality rating of manufacturing processes, at least within this particular dataset. Whilst the data were split into training and testing sets, the near-perfect predictive performance could be indicative of an overfit model, a common issue among non-linear regression models. Therefore, the generalisability of the model is questionable at best - more data would be required to validate the model further. 
+
+
+
+\clearpage 
+# References
